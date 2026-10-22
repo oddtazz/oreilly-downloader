@@ -3,3 +3,4 @@
 *.epub.part
 oreilly.conf
 oreilly.tmp
+__pycache__/
