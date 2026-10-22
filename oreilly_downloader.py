@@ -32,6 +32,7 @@ Exit codes: 0 all books OK, 1 one or more books failed, 2 token problem.
 import argparse
 import asyncio
 import base64
+import fcntl
 import json
 import os
 import re
@@ -80,6 +81,8 @@ class TokenError(Exception):
 
 class BookError(Exception):
     pass
+
+
 
 
 # --- token -----------------------------------------------------------------
@@ -159,6 +162,84 @@ async def refresh_jwt(jwt, rt):
     return new_jwt, got.get('orm-rt') or rt
 
 
+class Tokens:
+    """One place that owns orm-jwt/orm-rt for a run.
+
+    Safe against the token changing under a long run:
+    * renewal holds an exclusive lock on oreilly.conf.lock, so two runs never
+      renew at the same time;
+    * before renewing, it re-reads oreilly.conf. If someone else already
+      renewed (another run) or pasted new cookies (--setup / hand edit), it
+      uses those instead of its in-memory copy;
+    * the download session's cookie is updated in place after every change.
+    """
+
+    def __init__(self, jwt, rt):
+        self.jwt, self.rt = jwt, rt
+        self.exp = _exp_or_zero(jwt)
+        self.session = None
+        self.changes = 0            # bumps every time the jwt in use changes
+        self._lock = asyncio.Lock()
+
+    def _apply(self, jwt, rt):
+        if jwt != self.jwt:
+            self.changes += 1
+        self.jwt, self.rt, self.exp = jwt, rt, _exp_or_zero(jwt)
+        if self.session is not None:
+            self.session.cookie_jar.update_cookies({'orm-jwt': jwt})
+
+    def _adopt_from_conf(self, margin):
+        """Use cookies from oreilly.conf if they are newer than ours."""
+        if os.environ.get('ORM_JWT'):
+            return False
+        cj, cr = read_conf('ORM_JWT'), read_conf('ORM_RT')
+        changed = False
+        if cr and cr != self.rt:
+            print('orm-rt changed in the config; using the new one', file=sys.stderr)
+            self.rt, changed = cr, True
+        if cj and cj != self.jwt and _exp_or_zero(cj) > self.exp:
+            self._apply(cj, self.rt)
+            changed = True
+            if self.exp - time.time() >= margin:
+                print(f'picked up a newer orm-jwt from the config '
+                      f'(valid until {fmt_ts(self.exp)})', file=sys.stderr)
+        return changed
+
+    async def fresh(self, margin=REFRESH_MARGIN):
+        """Make sure the token has at least `margin` seconds left."""
+        async with self._lock:
+            if self.exp - time.time() >= margin:
+                return
+            with _conf_lock():
+                self._adopt_from_conf(margin)
+                if self.exp - time.time() >= margin:
+                    return
+                jwt, rt, exp = await ensure_fresh(self.jwt, self.rt, margin)
+                self._apply(jwt, rt)
+
+
+
+def _exp_or_zero(jwt):
+    try:
+        return jwt_expiry(jwt)
+    except TokenError:
+        return 0
+
+
+class _conf_lock:
+    """Exclusive flock on oreilly.conf.lock across processes."""
+
+    def __enter__(self):
+        path = CONFIG_FILE.with_name(CONFIG_FILE.name + '.lock')
+        self.fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
 async def ensure_fresh(jwt, rt, margin=REFRESH_MARGIN):
     """Return (jwt, rt, exp) with at least `margin` seconds of life left.
 
@@ -231,10 +312,20 @@ async def check_auth(session):
 
 # --- download --------------------------------------------------------------
 
-async def get(session, url, *, as_json=False):
-    """GET with retry on rate limits and server errors. Auth errors are fatal."""
+REQUEST_MARGIN = 20   # renew before any request if the token has less than this left
+
+
+async def get(session, url, *, as_json=False, tokens=None):
+    """GET with retry on rate limits and server errors. Auth errors are fatal.
+
+    O'Reilly does not reject an expired orm-jwt on book files: it answers 200
+    with a cut-short preview. So the token is checked before every request
+    and renewed if it is about to expire.
+    """
     status = None
     for attempt in range(RETRIES):
+        if tokens is not None:
+            await tokens.fresh(REQUEST_MARGIN)
         async with session.get(url) as r:
             status = r.status
             if status == 200:
@@ -297,9 +388,10 @@ def size_problem(entry, raw):
     return None
 
 
-async def fetch_book(book_id, session, *, allow_early=False):
+async def fetch_book(book_id, session, *, allow_early=False, tokens=None):
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
-    meta = await get(session, f'{BASE_URL}/api/v2/epubs/urn:orm:book:{book_id}/', as_json=True)
+    meta = await get(session, f'{BASE_URL}/api/v2/epubs/urn:orm:book:{book_id}/',
+                     as_json=True, tokens=tokens)
     if meta.get('content_format') not in (None, 'book'):
         raise BookError(f"not a book (content_format={meta.get('content_format')})")
     if meta.get('roughcut') and not allow_early:
@@ -308,7 +400,7 @@ async def fetch_book(book_id, session, *, allow_early=False):
 
     entries, expected, url = [], None, BASE_URL + root_path + '?limit=200'
     while url:
-        page = await get(session, url, as_json=True)
+        page = await get(session, url, as_json=True, tokens=tokens)
         expected = page.get('count')
         entries.extend(page.get('results', []))
         url = page.get('next')
@@ -326,7 +418,7 @@ async def fetch_book(book_id, session, *, allow_early=False):
 
     async def one(entry):
         async with sem:
-            raw = await get(session, entry['url'])
+            raw = await get(session, entry['url'], tokens=tokens)
         raw_sizes[entry['full_path']] = len(raw)
         reason = size_problem(entry, raw)
         if reason:
@@ -532,10 +624,10 @@ async def amain():
     target = None if args.no_alert else (
         args.alert or os.environ.get('OREILLY_ALERT_TARGET') or read_conf('ALERT_TARGET') or None)
 
-    rt = load_rt()
     try:
-        jwt = load_jwt(args.jwt)
-        jwt, rt, exp = await ensure_fresh(jwt, rt)
+        tokens = Tokens(load_jwt(args.jwt), load_rt())
+        await tokens.fresh()
+        jwt, rt, exp = tokens.jwt, tokens.rt, tokens.exp
     except (TokenError, aiohttp.ClientError, asyncio.TimeoutError) as e:
         alert([f'login: {e}', f"books: {' '.join(book_ids)}"], target)
         return 2
@@ -547,14 +639,18 @@ async def amain():
         except TokenError as e:
             alert([f'login: {e}', f"books: {' '.join(book_ids)}"], target)
             return 2
-        print(f'Logged in as {user}. Token valid until {fmt_ts(exp)}; renews itself.',
+        print(f'Logged in as {user}. Token valid until {fmt_ts(tokens.exp)}; renews itself.',
               file=sys.stderr)
         if args.check:
             return 0
         print(f'{len(book_ids)} book(s) -> {out_dir}', file=sys.stderr)
 
-        results, n = [], len(book_ids)
+        tokens.session = session
+        results, n, login_dead = [], len(book_ids), None
         for i, book_id in enumerate(book_ids, 1):
+            if login_dead:
+                results.append({'id': book_id, 'ok': False, 'error': 'not tried: login lost earlier in the run'})
+                continue
             tag = f'[{i}/{n}] {book_id}'
             existing = list(out_dir.glob(f'*_{book_id}.epub'))
             if existing and not args.force:
@@ -566,16 +662,32 @@ async def amain():
             print(f'{tag}  downloading...', file=sys.stderr, flush=True)
             t0 = time.time()
             try:
-                jwt, rt, exp = await ensure_fresh(jwt, rt)
-                session.cookie_jar.update_cookies({'orm-jwt': jwt})
-                meta, entries, files = await fetch_book(
-                    book_id, session, allow_early=args.allow_early_release)
+                for attempt in (1, 2):
+                    await tokens.fresh()
+                    before = tokens.changes
+                    try:
+                        meta, entries, files = await fetch_book(
+                            book_id, session, allow_early=args.allow_early_release,
+                            tokens=tokens)
+                        break
+                    except BookError as e:
+                        # A token swap during the book can leave a few files
+                        # cut short. Retry the whole book once on the new token.
+                        if attempt == 1 and tokens.changes != before and 'partial' in str(e):
+                            print(f'{tag}  token changed during download; retrying book',
+                                  file=sys.stderr)
+                            continue
+                        raise
                 path, manifest, spine = write_epub(book_id, meta, entries, files, out_dir)
                 r = {'id': book_id, 'ok': True, 'path': str(path), 'title': meta.get('title'),
                      'files': len(entries), 'manifest': manifest, 'spine': spine,
                      'mb': round(path.stat().st_size / 1e6, 1), 'secs': round(time.time() - t0, 1)}
                 print(f"{tag}  OK  {r['title']}  ({r['mb']} MB, {r['secs']}s)", file=sys.stderr)
-            except (BookError, TokenError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except TokenError as e:
+                login_dead = str(e)
+                r = {'id': book_id, 'ok': False, 'error': f'TokenError: {e}'}
+                print(f"{tag}  FAILED  {e}\nStopping: the login cannot be renewed.", file=sys.stderr)
+            except (BookError, aiohttp.ClientError, asyncio.TimeoutError) as e:
                 r = {'id': book_id, 'ok': False, 'error': f'{type(e).__name__}: {e}'}
                 print(f"{tag}  FAILED  {e}", file=sys.stderr)
             results.append(r)
@@ -594,7 +706,7 @@ async def amain():
             print(f"  FAIL  {r['id']}  {r['error']}")
     if failed:
         alert([f"{r['id']}: {r['error']}" for r in failed], target)
-        return 1
+        return 2 if login_dead else 1
     return 0
 
 
