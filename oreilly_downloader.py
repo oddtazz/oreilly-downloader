@@ -50,6 +50,8 @@ ALERT_TARGET = os.environ.get('OREILLY_ALERT_TARGET', 'telegram')
 MIN_TOKEN_SECS = 60         # refuse a token with less life left than this
 CONCURRENCY = 4             # parallel file downloads; higher trips rate limits
 RETRIES = 5
+THROTTLE_WAITS = (15, 30, 60, 90, 120)  # O'Reilly throttles with 403 for minutes
+BOOK_PAUSE = 8                          # seconds between books in a batch
 HTML_MIN_RATIO = 0.85       # downloaded/declared size for HTML chapters
 HTML_SMALL = 4096           # below this, HTML size varies too much to compare
 BOOK_MIN_RATIO = 0.93       # downloaded/declared size for all HTML in the book
@@ -133,11 +135,14 @@ async def get(session, url, *, as_json=False):
                 return await (r.json() if as_json else r.read())
             if status == 401:
                 raise TokenError(f'HTTP 401 on {url}; token died mid-run')
-            if status in (403, 429) or status >= 500:
+            if status in (403, 429):
+                await asyncio.sleep(THROTTLE_WAITS[min(attempt, len(THROTTLE_WAITS) - 1)])
+                continue
+            if status >= 500:
                 await asyncio.sleep(2 ** attempt)
                 continue
             raise BookError(f'HTTP {status} on {url}')
-    raise BookError(f'gave up after {RETRIES} tries on {url} (last HTTP {status})')
+    raise BookError(f'rate-limited: gave up after {RETRIES} tries on {url} (last HTTP {status})')
 
 
 def to_xhtml(s, root_path):
@@ -338,6 +343,8 @@ async def amain():
             if existing and not args.force:
                 results.append({'id': book_id, 'ok': True, 'path': str(existing[0]), 'skipped': True})
                 continue
+            if results and not results[-1].get('skipped'):
+                await asyncio.sleep(BOOK_PAUSE)
             t0 = time.time()
             try:
                 if exp - time.time() < MIN_TOKEN_SECS:
