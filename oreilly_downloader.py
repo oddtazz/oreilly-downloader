@@ -8,8 +8,10 @@
 
 Customised for Lola (Hermes) as the only user:
 
-* Runs only with an active orm-jwt. It checks the token expiry and does a
-  live auth call before any download. No token, or a dead token, means exit 2.
+* Runs only with an active orm-jwt. If the token has under 5 minutes left
+  and an orm-rt is stored, it waits for expiry (O'Reilly will not renew a
+  live token), renews orm-jwt itself and saves it. It then makes a live auth call before any download. No usable
+  token means exit 2.
 * Each file is checked against the size the API reports. HTML chapters that
   come back short (the silent truncation O'Reilly does for unauthenticated
   requests) fail the book.
@@ -45,6 +47,11 @@ from lxml import html as lhtml
 
 BASE_URL = 'https://learning.oreilly.com'
 JWT_FILE = Path.home() / '.config/oreilly/jwt'
+RT_FILE = Path.home() / '.config/oreilly/rt'
+REFRESH_URL = BASE_URL + '/profile/'   # returns new orm-jwt when sent orm-rt + last orm-jwt
+REFRESH_MARGIN = int(os.environ.get('OREILLY_REFRESH_MARGIN', 180))  # renew below this
+UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/141.0 Safari/537.36')
 OUT_DIR = Path(os.environ.get('OREILLY_DL_DIR', Path.home() / '.hermes/nas/books/oreilly'))
 ALERT_TARGET = os.environ.get('OREILLY_ALERT_TARGET', 'telegram')
 MIN_TOKEN_SECS = 60         # refuse a token with less life left than this
@@ -76,14 +83,90 @@ class BookError(Exception):
 
 # --- token -----------------------------------------------------------------
 
+def read_secret(path):
+    return path.read_text().strip() if path.exists() else ''
+
+
+def write_secret(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(value + '\n')
+    os.replace(tmp, path)
+
+
 def load_jwt(arg):
-    jwt = arg or os.environ.get('ORM_JWT')
-    if not jwt and JWT_FILE.exists():
-        jwt = JWT_FILE.read_text()
-    jwt = (jwt or '').strip()
+    jwt = (arg or os.environ.get('ORM_JWT') or read_secret(JWT_FILE)).strip()
     if not jwt:
         raise TokenError(f'no orm-jwt (pass --jwt, set ORM_JWT, or write {JWT_FILE})')
     return jwt
+
+
+def load_rt():
+    return (os.environ.get('ORM_RT') or read_secret(RT_FILE)).strip()
+
+
+async def refresh_jwt(jwt, rt):
+    """Swap orm-rt + last orm-jwt (expired is fine) for a new orm-jwt.
+
+    learning.oreilly.com renews the session on a normal page load: send both
+    cookies to /profile/ and it answers with Set-Cookie orm-jwt (and orm-rt).
+    orm-rt alone is not enough; the server needs the previous orm-jwt too.
+    """
+    if not rt:
+        raise TokenError(f'orm-jwt needs renewal but no orm-rt (write {RT_FILE})')
+    headers = {'Cookie': f'orm-rt={rt}; orm-jwt={jwt}', 'User-Agent': UA,
+               'Accept': 'text/html'}
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()) as s:
+        async with s.get(REFRESH_URL, headers=headers, allow_redirects=False) as r:
+            status = r.status
+            got = {}
+            for h in r.headers.getall('Set-Cookie', []):
+                name, _, rest = h.partition('=')
+                if name.strip() in ('orm-jwt', 'orm-rt'):
+                    got[name.strip()] = rest.split(';', 1)[0]
+    new_jwt = got.get('orm-jwt')
+    if not new_jwt:
+        raise TokenError(f'orm-jwt refresh failed (HTTP {status}, no new cookie); '
+                         'orm-rt may be revoked: log in again and copy orm-rt + orm-jwt')
+    jwt_expiry(new_jwt)  # raises if the server sent something odd
+    write_secret(JWT_FILE, new_jwt)
+    if got.get('orm-rt') and got['orm-rt'] != rt:
+        write_secret(RT_FILE, got['orm-rt'])
+    return new_jwt, got.get('orm-rt') or rt
+
+
+async def ensure_fresh(jwt, rt, margin=REFRESH_MARGIN):
+    """Return (jwt, rt, exp) with at least `margin` seconds of life left.
+
+    O'Reilly only issues a new orm-jwt once the current one has expired
+    (seen: exp 15:38:35, no renewal at 15:38:17, renewed at 15:39:18). So if
+    the token is close to expiry, wait it out, then renew.
+    """
+    try:
+        exp = jwt_expiry(jwt)
+    except TokenError:
+        exp = 0
+    left = exp - time.time()
+    if left >= margin:
+        return jwt, rt, exp
+    if left > 0:
+        if not rt:
+            raise TokenError(f'orm-jwt expires in {int(left)}s and no orm-rt to renew it')
+        print(f'orm-jwt expires in {int(left)}s; waiting to renew', file=sys.stderr)
+        await asyncio.sleep(left + 3)
+    for attempt in range(4):
+        try:
+            jwt, rt = await refresh_jwt(jwt, rt)
+            break
+        except TokenError:
+            if attempt == 3:
+                raise
+            await asyncio.sleep(15)
+    exp = check_expiry(jwt)
+    print(f'orm-jwt renewed, valid until {fmt_ts(exp)}', file=sys.stderr)
+    return jwt, rt, exp
 
 
 def jwt_expiry(jwt):
@@ -311,20 +394,25 @@ def alert(lines, enabled):
 
 async def amain():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    p.add_argument('book_ids', nargs='+', help="ISBN / O'Reilly id, e.g. 9781491958698")
+    p.add_argument('book_ids', nargs='*', help="ISBN / O'Reilly id, e.g. 9781491958698")
     p.add_argument('--jwt', help=f'orm-jwt cookie (default: $ORM_JWT, then {JWT_FILE})')
     p.add_argument('--no-alert', action='store_true', help='do not send failure alerts')
     p.add_argument('--force', action='store_true', help='re-download books already on disk')
     p.add_argument('--json', action='store_true', help='print one JSON result per book')
     p.add_argument('--allow-early-release', action='store_true',
                    help='accept unfinished Early Release (rough cut) books')
+    p.add_argument('--check-auth', action='store_true',
+                   help='renew the token if needed, verify it, download nothing')
     args = p.parse_args()
+    if not args.book_ids and not args.check_auth:
+        p.error('give at least one book id, or --check-auth')
     alerts = not args.no_alert
 
+    rt = load_rt()
     try:
         jwt = load_jwt(args.jwt)
-        exp = check_expiry(jwt)
-    except TokenError as e:
+        jwt, rt, exp = await ensure_fresh(jwt, rt)
+    except (TokenError, aiohttp.ClientError, asyncio.TimeoutError) as e:
         alert([f'token: {e}', f"books: {' '.join(args.book_ids)}"], alerts)
         return 2
 
@@ -336,6 +424,8 @@ async def amain():
             alert([f'token: {e}', f"books: {' '.join(args.book_ids)}"], alerts)
             return 2
         print(f'auth ok: {user}, token valid until {fmt_ts(exp)}', file=sys.stderr)
+        if args.check_auth:
+            return 0
 
         results = []
         for book_id in args.book_ids:
@@ -347,8 +437,8 @@ async def amain():
                 await asyncio.sleep(BOOK_PAUSE)
             t0 = time.time()
             try:
-                if exp - time.time() < MIN_TOKEN_SECS:
-                    raise TokenError(f'orm-jwt expired at {fmt_ts(exp)}')
+                jwt, rt, exp = await ensure_fresh(jwt, rt)
+                session.cookie_jar.update_cookies({'orm-jwt': jwt})
                 meta, entries, files = await fetch_book(
                     book_id, session, allow_early=args.allow_early_release)
                 path, manifest, spine = write_epub(book_id, meta, entries, files)

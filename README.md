@@ -32,6 +32,14 @@ This fork is set up for one operator (Lola / Hermes):
   non-empty spine, every chapter closes `</html>`). The file is moved into
   place only after it passes. A failed book leaves no file and does not
   replace an existing good copy.
+- **Token renewal.** Store `orm-rt` in `~/.config/oreilly/rt` (or `$ORM_RT`)
+  next to the last `orm-jwt`. When `orm-jwt` has under 3 minutes left, the
+  script waits for it to expire, then sends `orm-rt` + the old `orm-jwt` to
+  `https://learning.oreilly.com/profile/`. O'Reilly answers with a new
+  `orm-jwt` (Set-Cookie), which is saved (mode 600). This is the same call a
+  browser makes on a page load. O'Reilly does not renew a token that is still
+  live, and `orm-rt` alone is not enough. `--check-auth` renews and verifies
+  without downloading.
 - **Full books only.** For titles the account cannot read, O'Reilly serves a
   preview: every chapter is cut short but still returns HTTP 200. The script
   fails the book if any chapter is short, if all chapters together are under
