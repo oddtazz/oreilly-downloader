@@ -35,6 +35,7 @@ import base64
 import fcntl
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -57,10 +58,46 @@ UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
 OUT_DIR = REPO_DIR / 'books'   # overridden by -o, $OREILLY_DL_DIR or OUT_DIR= in oreilly.conf
 ALERT_TARGET = 'telegram'      # overridden by $OREILLY_ALERT_TARGET or ALERT_TARGET= in oreilly.conf
 MIN_TOKEN_SECS = 60         # refuse a token with less life left than this
-CONCURRENCY = 4             # parallel file downloads; higher trips rate limits
+CONCURRENCY = 2             # parallel file downloads per book; a reader loads ~1-2 at a time
 RETRIES = 5
-THROTTLE_WAITS = (15, 30, 60, 90, 120)  # O'Reilly throttles with 403 for minutes
-BOOK_PAUSE = 8                          # seconds between books in a batch
+BOOK_PAUSE = (45, 120)      # random pause between books, seconds (like a person moving on)
+MAX_BOOKS = 10              # books per run unless --max-books says otherwise
+COOL_OFF = 300              # first throttle (HTTP 403/429): stop everything for 5 minutes
+
+
+class Throttled(Exception):
+    """O'Reilly is rate-limiting us. Stop the run instead of pushing through."""
+
+
+class Pace:
+    """Shared rate-limit state for a run.
+
+    Polite by design: few parallel requests, long random gaps between books,
+    a cap on books per run. On the first throttle response, everything pauses
+    for COOL_OFF and the book is retried once. A second throttle in the same
+    run ends the run; remaining books are left for a later run (books on disk
+    are skipped, so re-running resumes).
+    """
+
+    def __init__(self):
+        self.throttles = 0
+        self.cool_end = 0.0
+        self.lock = asyncio.Lock()
+
+    async def hit(self, url, status, sent_at):
+        async with self.lock:
+            if sent_at < self.cool_end:
+                return      # same throttle event as a parallel request; cool-off already done
+            self.throttles += 1
+            if self.throttles > 1:
+                raise Throttled(f'HTTP {status} again; O\'Reilly is rate-limiting this account')
+            say(f'O\'Reilly answered HTTP {status} (rate limit). Pausing all downloads for '
+                f'{COOL_OFF // 60} min, then retrying once.')
+            await countdown(COOL_OFF, 'cool-off')
+            self.cool_end = time.time()
+
+
+PACE = Pace()
 HTML_MIN_RATIO = 0.85       # downloaded/declared size for HTML chapters
 HTML_SMALL = 4096           # below this, HTML size varies too much to compare
 BOOK_MIN_RATIO = 0.93       # downloaded/declared size for all HTML in the book
@@ -195,14 +232,13 @@ class Tokens:
         cj, cr = read_conf('ORM_JWT'), read_conf('ORM_RT')
         changed = False
         if cr and cr != self.rt:
-            print('orm-rt changed in the config; using the new one', file=sys.stderr)
+            say('orm-rt changed in the config; using the new one')
             self.rt, changed = cr, True
         if cj and cj != self.jwt and _exp_or_zero(cj) > self.exp:
             self._apply(cj, self.rt)
             changed = True
             if self.exp - time.time() >= margin:
-                print(f'picked up a newer orm-jwt from the config '
-                      f'(valid until {fmt_ts(self.exp)})', file=sys.stderr)
+                say(f'Picked up a newer login token from the config (valid until {fmt_ts(self.exp)}).')
         return changed
 
     async def fresh(self, margin=REFRESH_MARGIN):
@@ -257,8 +293,9 @@ async def ensure_fresh(jwt, rt, margin=REFRESH_MARGIN):
     if left > 0:
         if not rt:
             raise TokenError(f'orm-jwt expires in {int(left)}s and no orm-rt to renew it')
-        print(f'orm-jwt expires in {int(left)}s; waiting to renew', file=sys.stderr)
-        await asyncio.sleep(left + 3)
+        say(f'Login token expires in {int(left)}s. O\'Reilly only renews an expired '
+            'token, so waiting for it...')
+        await countdown(left + 3, 'token renewal')
     for attempt in range(4):
         try:
             jwt, rt = await refresh_jwt(jwt, rt)
@@ -268,7 +305,7 @@ async def ensure_fresh(jwt, rt, margin=REFRESH_MARGIN):
                 raise
             await asyncio.sleep(15)
     exp = check_expiry(jwt)
-    print(f'orm-jwt renewed, valid until {fmt_ts(exp)}', file=sys.stderr)
+    say(f'Login renewed, valid until {fmt_ts(exp)}.')
     return jwt, rt, exp
 
 
@@ -310,6 +347,69 @@ async def check_auth(session):
                      f'and orm-jwt cookies into {CONFIG_FILE}')
 
 
+
+# --- output ----------------------------------------------------------------
+# Everything human-facing goes to stdout, unbuffered, so it shows in a
+# terminal, through pipes and in log files. --quiet silences it; --json
+# sends it to stderr so stdout stays machine-readable.
+
+OUT = sys.stdout
+QUIET = False
+
+
+def say(msg):
+    if not QUIET:
+        print(msg, file=OUT, flush=True)
+
+
+def _fmt_secs(s):
+    s = int(s)
+    return f'{s // 60}m{s % 60:02d}s' if s >= 60 else f'{s}s'
+
+
+async def countdown(secs, what):
+    """Sleep, showing time left on a live line (or a line every 30 s if not a tty)."""
+    end = time.time() + secs
+    tty = OUT.isatty() and not QUIET
+    last = 0
+    while (left := end - time.time()) > 0:
+        if tty:
+            print(f'\r  waiting {_fmt_secs(left)} ({what})   ', end='', file=OUT, flush=True)
+        elif not QUIET and time.time() - last >= 30:
+            say(f'  waiting {_fmt_secs(left)} ({what})')
+            last = time.time()
+        await asyncio.sleep(min(1, left))
+    if tty:
+        print('\r' + ' ' * 50 + '\r', end='', file=OUT, flush=True)
+
+
+class Progress:
+    """Per-book progress: live bar on a terminal, 25% steps otherwise."""
+
+    def __init__(self, files, total_bytes, label):
+        self.files, self.total, self.label = files, max(total_bytes, 1), label
+        self.n = self.got = 0
+        self.t0 = time.time()
+        self.tty = OUT.isatty() and not QUIET
+        self.next_pct = 25
+
+    def step(self, nbytes):
+        self.n += 1
+        self.got += nbytes
+        pct = min(100, self.got * 100 // self.total)
+        if self.tty:
+            bar = '#' * (pct // 5) + '-' * (20 - pct // 5)
+            print(f'\r{self.label}  [{bar}] {pct:3d}%  {self.n}/{self.files} files  '
+                  f'{self.got / 1e6:.1f} MB', end='', file=OUT, flush=True)
+        elif not QUIET and pct >= self.next_pct:
+            say(f'{self.label}  {pct}%  ({self.n}/{self.files} files)')
+            self.next_pct = (pct // 25 + 1) * 25
+
+    def done(self):
+        if self.tty:
+            print('\r' + ' ' * 90 + '\r', end='', file=OUT, flush=True)
+
+
 # --- download --------------------------------------------------------------
 
 REQUEST_MARGIN = 20   # renew before any request if the token has less than this left
@@ -326,6 +426,7 @@ async def get(session, url, *, as_json=False, tokens=None):
     for attempt in range(RETRIES):
         if tokens is not None:
             await tokens.fresh(REQUEST_MARGIN)
+        sent_at = time.time()
         async with session.get(url) as r:
             status = r.status
             if status == 200:
@@ -333,13 +434,13 @@ async def get(session, url, *, as_json=False, tokens=None):
             if status == 401:
                 raise TokenError(f'HTTP 401 on {url}; token died mid-run')
             if status in (403, 429):
-                await asyncio.sleep(THROTTLE_WAITS[min(attempt, len(THROTTLE_WAITS) - 1)])
+                await PACE.hit(url, status, sent_at)
                 continue
             if status >= 500:
                 await asyncio.sleep(2 ** attempt)
                 continue
             raise BookError(f'HTTP {status} on {url}')
-    raise BookError(f'rate-limited: gave up after {RETRIES} tries on {url} (last HTTP {status})')
+    raise BookError(f'gave up after {RETRIES} tries on {url} (last HTTP {status})')
 
 
 def to_xhtml(s, root_path):
@@ -388,7 +489,7 @@ def size_problem(entry, raw):
     return None
 
 
-async def fetch_book(book_id, session, *, allow_early=False, tokens=None):
+async def fetch_book(book_id, session, *, allow_early=False, tokens=None, label=''):
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
     meta = await get(session, f'{BASE_URL}/api/v2/epubs/urn:orm:book:{book_id}/',
                      as_json=True, tokens=tokens)
@@ -415,11 +516,13 @@ async def fetch_book(book_id, session, *, allow_early=False, tokens=None):
 
     sem = asyncio.Semaphore(CONCURRENCY)
     files, problems, raw_sizes = {}, [], {}
+    prog = Progress(len(entries), sum(e.get('file_size') or 0 for e in entries), label)
 
     async def one(entry):
         async with sem:
             raw = await get(session, entry['url'], tokens=tokens)
         raw_sizes[entry['full_path']] = len(raw)
+        prog.step(len(raw))
         reason = size_problem(entry, raw)
         if reason:
             problems.append(f"{entry['full_path']}: {reason}")
@@ -427,7 +530,10 @@ async def fetch_book(book_id, session, *, allow_early=False, tokens=None):
         path = entry['full_path']
         files[path] = to_xhtml(raw, root_path) if path.endswith(('.html', '.xhtml')) else raw
 
-    await asyncio.gather(*[one(e) for e in entries])
+    try:
+        await asyncio.gather(*[one(e) for e in entries])
+    finally:
+        prog.done()
     if problems:
         raise BookError(f'partial book, {len(problems)} bad file(s): '
                         + '; '.join(sorted(problems)[:5]))
@@ -568,7 +674,13 @@ EPILOG = """examples:
   oreilly-dl --setup                       paste your cookies (first-time setup)
   oreilly-dl --check                       is my login still good?
 
-exit codes: 0 all OK, 1 a book failed, 2 login problem
+pacing (to stay polite and avoid scraping flags):
+  at most 2 files at a time, a random 45-120 s pause between books, and
+  10 books per run (--max-books). On a rate-limit answer it pauses 5 min and
+  retries once; a second one ends the run. Re-run later to resume: books
+  already downloaded are skipped.
+
+exit codes: 0 all OK, 1 a book failed, 2 login problem, 3 rate-limited (run again later)
 """
 
 
@@ -592,8 +704,18 @@ async def amain():
     p.add_argument('--alert', metavar='TARGET',
                    help='on failure, send a message via `hermes send -t TARGET` (e.g. telegram)')
     p.add_argument('--no-alert', action='store_true', help='never send a failure alert')
+    p.add_argument('--max-books', type=int, default=MAX_BOOKS, metavar='N',
+                   help=f'download at most N books this run (default {MAX_BOOKS}); the rest wait for the next run')
+    p.add_argument('--pause', type=int, nargs=2, default=list(BOOK_PAUSE), metavar=('MIN', 'MAX'),
+                   help=f'random pause between books in seconds (default {BOOK_PAUSE[0]} {BOOK_PAUSE[1]})')
+    p.add_argument('-q', '--quiet', action='store_true', help='only print the final summary and errors')
     p.add_argument('--jwt', help=argparse.SUPPRESS)
     args = p.parse_args()
+
+    global OUT, QUIET
+    QUIET = args.quiet
+    if args.json:
+        OUT = sys.stderr
 
     if args.setup:
         rc = setup_config()
@@ -618,101 +740,127 @@ async def amain():
     if not book_ids and not args.check:
         p.print_help()
         return 2
+    pmin, pmax = sorted(max(0, x) for x in args.pause)
 
     out_dir = Path(args.out or os.environ.get('OREILLY_DL_DIR') or read_conf('OUT_DIR') or OUT_DIR)
     out_dir = out_dir.expanduser()
     target = None if args.no_alert else (
         args.alert or os.environ.get('OREILLY_ALERT_TARGET') or read_conf('ALERT_TARGET') or None)
 
+    say('Checking login...')
     try:
         tokens = Tokens(load_jwt(args.jwt), load_rt())
         await tokens.fresh()
-        jwt, rt, exp = tokens.jwt, tokens.rt, tokens.exp
     except (TokenError, aiohttp.ClientError, asyncio.TimeoutError) as e:
         alert([f'login: {e}', f"books: {' '.join(book_ids)}"], target)
         return 2
 
     timeout = aiohttp.ClientTimeout(total=None, sock_read=60)
-    async with aiohttp.ClientSession(cookies={'orm-jwt': jwt}, timeout=timeout) as session:
+    async with aiohttp.ClientSession(cookies={'orm-jwt': tokens.jwt}, timeout=timeout,
+                                     headers={'User-Agent': UA}) as session:
         try:
             user = await check_auth(session)
         except TokenError as e:
             alert([f'login: {e}', f"books: {' '.join(book_ids)}"], target)
             return 2
-        print(f'Logged in as {user}. Token valid until {fmt_ts(tokens.exp)}; renews itself.',
-              file=sys.stderr)
+        say(f'Logged in as {user}. Token valid until {fmt_ts(tokens.exp)}; renews itself.')
         if args.check:
             return 0
-        print(f'{len(book_ids)} book(s) -> {out_dir}', file=sys.stderr)
+
+        todo = [b for b in book_ids if args.force or not list(out_dir.glob(f'*_{b}.epub'))]
+        have = len(book_ids) - len(todo)
+        later = todo[args.max_books:] if args.max_books > 0 else []
+        todo = todo[:args.max_books] if args.max_books > 0 else todo
+        say(f'{len(book_ids)} book(s) in list: {have} already downloaded, {len(todo)} to get now'
+            + (f', {len(later)} left for the next run (--max-books {args.max_books})' if later else '')
+            + f'.\nSaving to {out_dir}')
+        if len(todo) > 1:
+            est = (len(todo) - 1) * (pmin + pmax) / 2
+            say(f'Pausing {pmin}-{pmax}s between books; expect roughly {_fmt_secs(est)} of pauses.')
 
         tokens.session = session
-        results, n, login_dead = [], len(book_ids), None
-        for i, book_id in enumerate(book_ids, 1):
-            if login_dead:
-                results.append({'id': book_id, 'ok': False, 'error': 'not tried: login lost earlier in the run'})
+        results, n, stop = [], len(todo), None
+        for b in book_ids:
+            if b not in todo and b not in later:
+                results.append({'id': b, 'ok': True, 'skipped': True,
+                                'path': str(next(out_dir.glob(f'*_{b}.epub')))})
+        for i, book_id in enumerate(todo, 1):
+            if stop:
+                results.append({'id': book_id, 'ok': False, 'not_tried': True, 'error': f'not tried: {stop}'})
                 continue
             tag = f'[{i}/{n}] {book_id}'
-            existing = list(out_dir.glob(f'*_{book_id}.epub'))
-            if existing and not args.force:
-                print(f'{tag}  already have it, skipped', file=sys.stderr)
-                results.append({'id': book_id, 'ok': True, 'path': str(existing[0]), 'skipped': True})
-                continue
-            if results and not results[-1].get('skipped'):
-                await asyncio.sleep(BOOK_PAUSE)
-            print(f'{tag}  downloading...', file=sys.stderr, flush=True)
+            if i > 1:
+                await countdown(random.uniform(pmin, pmax), 'pause between books')
+            say(f'{tag}  fetching book info...')
             t0 = time.time()
             try:
                 for attempt in (1, 2):
                     await tokens.fresh()
-                    before = tokens.changes
+                    before, thr = tokens.changes, PACE.throttles
                     try:
                         meta, entries, files = await fetch_book(
                             book_id, session, allow_early=args.allow_early_release,
-                            tokens=tokens)
+                            tokens=tokens, label=tag)
                         break
                     except BookError as e:
-                        # A token swap during the book can leave a few files
-                        # cut short. Retry the whole book once on the new token.
-                        if attempt == 1 and tokens.changes != before and 'partial' in str(e):
-                            print(f'{tag}  token changed during download; retrying book',
-                                  file=sys.stderr)
+                        # A token swap or a cool-off during the book can leave files
+                        # cut short. Retry the whole book once.
+                        if attempt == 1 and 'partial' in str(e) and (
+                                tokens.changes != before or PACE.throttles != thr):
+                            say(f'{tag}  interrupted mid-book; downloading it again')
                             continue
                         raise
                 path, manifest, spine = write_epub(book_id, meta, entries, files, out_dir)
                 r = {'id': book_id, 'ok': True, 'path': str(path), 'title': meta.get('title'),
                      'files': len(entries), 'manifest': manifest, 'spine': spine,
                      'mb': round(path.stat().st_size / 1e6, 1), 'secs': round(time.time() - t0, 1)}
-                print(f"{tag}  OK  {r['title']}  ({r['mb']} MB, {r['secs']}s)", file=sys.stderr)
+                say(f"{tag}  OK  {r['title']}  ({r['mb']} MB, {r['secs']}s)")
+            except Throttled as e:
+                stop = 'rate-limited; run again later to resume'
+                r = {'id': book_id, 'ok': False, 'error': f'Throttled: {e}'}
+                say(f'{tag}  STOPPED  {e}. Ending the run so the account is not flagged.')
             except TokenError as e:
-                login_dead = str(e)
+                stop = 'login lost'
                 r = {'id': book_id, 'ok': False, 'error': f'TokenError: {e}'}
-                print(f"{tag}  FAILED  {e}\nStopping: the login cannot be renewed.", file=sys.stderr)
+                say(f'{tag}  FAILED  {e}\nStopping: the login cannot be renewed.')
             except (BookError, aiohttp.ClientError, asyncio.TimeoutError) as e:
                 r = {'id': book_id, 'ok': False, 'error': f'{type(e).__name__}: {e}'}
-                print(f"{tag}  FAILED  {e}", file=sys.stderr)
+                say(f'{tag}  FAILED  {e}')
             results.append(r)
+        for b in later:
+            results.append({'id': b, 'ok': True, 'deferred': True})
 
-    ok = [r for r in results if r['ok'] and not r.get('skipped')]
+    ok = [r for r in results if r['ok'] and r.get('path') and not r.get('skipped')]
     skipped = [r for r in results if r.get('skipped')]
-    failed = [r for r in results if not r['ok']]
+    deferred = [r for r in results if r.get('deferred')]
+    not_tried = [r for r in results if r.get('not_tried')]
+    failed = [r for r in results if not r['ok'] and not r.get('not_tried')]
     if args.json:
         for r in results:
-            print(json.dumps(r))
+            print(json.dumps(r), flush=True)
     else:
-        print(f'\nDone: {len(ok)} downloaded, {len(skipped)} already there, {len(failed)} failed.')
+        line = (f'\nDone: {len(ok)} downloaded, {len(skipped)} already there, {len(failed)} failed')
+        if not_tried or deferred:
+            line += f', {len(not_tried) + len(deferred)} left for next run'
+        print(line + '.', flush=True)
         for r in ok:
             print(f"  OK    {r['path']}")
         for r in failed:
             print(f"  FAIL  {r['id']}  {r['error']}")
+        if not_tried or deferred:
+            print('  Run the same command again later to continue; finished books are skipped.')
     if failed:
         alert([f"{r['id']}: {r['error']}" for r in failed], target)
-        return 2 if login_dead else 1
-    return 0
+    if stop and stop.startswith('rate'):
+        return 3
+    if stop:
+        return 2
+    return 1 if failed else 0
 
 
 if __name__ == '__main__':
     try:
         sys.exit(asyncio.run(amain()))
     except KeyboardInterrupt:
-        print('\nStopped. Finished books are saved; unfinished ones left no files.', file=sys.stderr)
+        print('\nStopped. Finished books are saved; unfinished ones left no files.', flush=True)
         sys.exit(130)

@@ -40,21 +40,42 @@ ignored:
 https://learning.oreilly.com/library/view/fluent-python-2nd/9781492056348/
 ```
 
-Output looks like this:
+Output looks like this (the bar and countdowns update in place in a
+terminal; in a pipe or log file you get a line per 25% instead):
 
 ```
+Checking login...
 Logged in as you. Token valid until 16:10; renews itself.
-2 book(s) -> /home/you/Books/oreilly
-[1/2] 9781491903063  downloading...
-[1/2] 9781491903063  OK  Designing Data-Intensive Applications  (20.4 MB, 9.1s)
-[2/2] 9781492056348  already have it, skipped
+3 book(s) in list: 1 already downloaded, 2 to get now.
+Saving to /home/you/Books/oreilly
+Pausing 45-120s between books; expect roughly 1m22s of pauses.
+[1/2] 9781098118723  fetching book info...
+[1/2] 9781098118723  [########------------]  42%  33/86 files  3.8 MB
+[1/2] 9781098118723  OK  The Staff Engineer's Path  (7.3 MB, 7.3s)
+  waiting 1m04s (pause between books)
+[2/2] 9781098153632  OK  Platform Engineering  (2.9 MB, 2.9s)
 
-Done: 1 downloaded, 1 already there, 0 failed.
+Done: 2 downloaded, 1 already there, 0 failed.
 ```
 
 Books already in the output folder are skipped. Use `--force` to download
 them again. Ctrl-C is safe: finished books stay, and unfinished ones leave no
-file.
+file. `-q` prints only the summary.
+
+## Rate limits: how it stays polite
+
+O'Reilly answers HTTP 403 when an account pulls too much too fast. The
+script paces itself so a list looks like a person reading, not a scraper:
+
+- at most 2 files at a time within a book;
+- a random 45-120 s pause between books (`--pause MIN MAX`);
+- at most 10 books per run (`--max-books N`); the rest wait for the next run;
+- on the first 403/429 it stops all downloads for 5 minutes, then retries
+  once. A second one ends the run with exit code 3. Nothing is half-saved.
+
+To get through a long list, run the same command again later (an hour or
+the next day). Finished books are skipped, so it carries on where it
+stopped.
 
 ## Config: `oreilly.conf`
 
@@ -93,7 +114,7 @@ The environment variables `ORM_RT`, `ORM_JWT`, `OREILLY_DL_DIR`,
 - **Verified epub.** The epub is checked before it is saved: zip CRC,
   manifest, spine, and complete chapters. It is written to a temporary file
   and renamed only when it passes.
-- **Exit codes.** 0 all OK, 1 a book failed, 2 login problem.
+- **Exit codes.** 0 all OK, 1 a book failed, 2 login problem, 3 rate-limited (run again later).
 
 Please use this for books you are reading, one at a time. Bulk downloading
 breaks O'Reilly's terms and can get the account suspended.
