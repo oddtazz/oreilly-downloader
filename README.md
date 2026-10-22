@@ -14,11 +14,29 @@ and extracting the `orm-jwt` cookie using the developer tools.
 # Usage
 
 ```
-$ pip install aiohttp lxml
-$ python3 oreilly_downloader.py 9781491958698 --jwt 'XYZ'
-…
-created 9781491958698.epub
+$ python3 -m venv .venv && .venv/bin/pip install aiohttp lxml
+$ echo 'XYZ' > ~/.config/oreilly/jwt && chmod 600 ~/.config/oreilly/jwt
+$ .venv/bin/python oreilly_downloader.py 9781491958698 [more ids] [--force] [--json] [--no-alert]
+OK   9781491958698  ~/.hermes/nas/books/oreilly/Test-Driven-Development-with-Python-2nd-Edition_9781491958698.epub
 ```
+
+This fork is set up for one operator (Lola / Hermes):
+
+- **Active cookie only.** The token is read from `--jwt`, `$ORM_JWT` or
+  `~/.config/oreilly/jwt`. The script checks the JWT `exp` and makes a live
+  auth call before it downloads anything. A missing, expired or rejected
+  token stops the run (exit 2).
+- **Verified books only.** Every file is checked against the size the API
+  reports, so the silent per-chapter truncation is caught. The epub is then
+  checked (zip CRC, all API files present, all OPF manifest items present,
+  non-empty spine, every chapter closes `</html>`). The file is moved into
+  place only after it passes. A failed book leaves no file and does not
+  replace an existing good copy.
+- **Alert on failure only.** A failure sends a message with
+  `hermes send -t $OREILLY_ALERT_TARGET` (default `telegram`). Success is quiet.
+- Output dir: `$OREILLY_DL_DIR` (default `~/.hermes/nas/books/oreilly`).
+  Books already on disk are skipped unless `--force`.
+- Exit codes: 0 all OK, 1 a book failed, 2 token problem.
 
 # Contributing
 
