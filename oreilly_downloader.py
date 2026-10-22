@@ -46,8 +46,8 @@ from lxml import etree
 from lxml import html as lhtml
 
 BASE_URL = 'https://learning.oreilly.com'
-JWT_FILE = Path.home() / '.config/oreilly/jwt'
-RT_FILE = Path.home() / '.config/oreilly/rt'
+REPO_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = Path(os.environ.get('OREILLY_CONFIG', REPO_DIR / 'oreilly.conf'))  # gitignored
 REFRESH_URL = BASE_URL + '/profile/'   # returns new orm-jwt when sent orm-rt + last orm-jwt
 REFRESH_MARGIN = int(os.environ.get('OREILLY_REFRESH_MARGIN', 180))  # renew below this
 UA = ('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
@@ -83,28 +83,46 @@ class BookError(Exception):
 
 # --- token -----------------------------------------------------------------
 
-def read_secret(path):
-    return path.read_text().strip() if path.exists() else ''
+def read_conf(key):
+    """Read KEY=value from oreilly.conf. Blank lines and # comments are ignored."""
+    if not CONFIG_FILE.exists():
+        return ''
+    for line in CONFIG_FILE.read_text().splitlines():
+        k, sep, v = line.partition('=')
+        if sep and not line.lstrip().startswith('#') and k.strip() == key:
+            return v.strip().strip('"').strip("'")
+    return ''
 
 
-def write_secret(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix('.tmp')
+def write_conf(key, value):
+    """Set KEY=value in oreilly.conf, keeping comments and other lines. Mode 600."""
+    lines = CONFIG_FILE.read_text().splitlines() if CONFIG_FILE.exists() else []
+    out, done = [], False
+    for line in lines:
+        k, sep, _ = line.partition('=')
+        if sep and not line.lstrip().startswith('#') and k.strip() == key:
+            out.append(f'{key}={value}')
+            done = True
+        else:
+            out.append(line)
+    if not done:
+        out.append(f'{key}={value}')
+    tmp = CONFIG_FILE.with_suffix('.tmp')
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w') as f:
-        f.write(value + '\n')
-    os.replace(tmp, path)
+        f.write('\n'.join(out) + '\n')
+    os.replace(tmp, CONFIG_FILE)
 
 
 def load_jwt(arg):
-    jwt = (arg or os.environ.get('ORM_JWT') or read_secret(JWT_FILE)).strip()
+    jwt = (arg or os.environ.get('ORM_JWT') or read_conf('ORM_JWT')).strip()
     if not jwt:
-        raise TokenError(f'no orm-jwt (pass --jwt, set ORM_JWT, or write {JWT_FILE})')
+        raise TokenError(f'no orm-jwt (set ORM_JWT in {CONFIG_FILE})')
     return jwt
 
 
 def load_rt():
-    return (os.environ.get('ORM_RT') or read_secret(RT_FILE)).strip()
+    return (os.environ.get('ORM_RT') or read_conf('ORM_RT')).strip()
 
 
 async def refresh_jwt(jwt, rt):
@@ -115,7 +133,7 @@ async def refresh_jwt(jwt, rt):
     orm-rt alone is not enough; the server needs the previous orm-jwt too.
     """
     if not rt:
-        raise TokenError(f'orm-jwt needs renewal but no orm-rt (write {RT_FILE})')
+        raise TokenError(f'orm-jwt needs renewal but no orm-rt (set ORM_RT in {CONFIG_FILE})')
     headers = {'Cookie': f'orm-rt={rt}; orm-jwt={jwt}', 'User-Agent': UA,
                'Accept': 'text/html'}
     async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()) as s:
@@ -131,9 +149,9 @@ async def refresh_jwt(jwt, rt):
         raise TokenError(f'orm-jwt refresh failed (HTTP {status}, no new cookie); '
                          'orm-rt may be revoked: log in again and copy orm-rt + orm-jwt')
     jwt_expiry(new_jwt)  # raises if the server sent something odd
-    write_secret(JWT_FILE, new_jwt)
+    write_conf('ORM_JWT', new_jwt)
     if got.get('orm-rt') and got['orm-rt'] != rt:
-        write_secret(RT_FILE, got['orm-rt'])
+        write_conf('ORM_RT', got['orm-rt'])
     return new_jwt, got.get('orm-rt') or rt
 
 
@@ -395,7 +413,7 @@ def alert(lines, enabled):
 async def amain():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('book_ids', nargs='*', help="ISBN / O'Reilly id, e.g. 9781491958698")
-    p.add_argument('--jwt', help=f'orm-jwt cookie (default: $ORM_JWT, then {JWT_FILE})')
+    p.add_argument('--jwt', help=f'orm-jwt cookie (default: $ORM_JWT, then {CONFIG_FILE})')
     p.add_argument('--no-alert', action='store_true', help='do not send failure alerts')
     p.add_argument('--force', action='store_true', help='re-download books already on disk')
     p.add_argument('--json', action='store_true', help='print one JSON result per book')

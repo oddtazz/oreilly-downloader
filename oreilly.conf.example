@@ -1,0 +1,10 @@
+# O'Reilly login cookies for oreilly_downloader.py.
+# Copy this file to oreilly.conf (gitignored) and paste the values.
+# Get them from learning.oreilly.com: DevTools -> Application -> Cookies.
+#
+# ORM_RT  = refresh cookie, long-lived (about 30 days). Replace after logout/re-login.
+# ORM_JWT = access cookie, short-lived (~15 min). The script renews it itself
+#           from ORM_RT and writes the new value back here. Paste the current
+#           one when you replace ORM_RT; an expired one also works.
+ORM_RT=
+ORM_JWT=

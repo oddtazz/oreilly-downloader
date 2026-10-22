@@ -15,7 +15,7 @@ and extracting the `orm-jwt` cookie using the developer tools.
 
 ```
 $ python3 -m venv .venv && .venv/bin/pip install aiohttp lxml
-$ echo 'XYZ' > ~/.config/oreilly/jwt && chmod 600 ~/.config/oreilly/jwt
+$ cp oreilly.conf.example oreilly.conf && chmod 600 oreilly.conf   # paste ORM_RT and ORM_JWT
 $ .venv/bin/python oreilly_downloader.py 9781491958698 [more ids] [--force] [--json] [--no-alert]
 OK   9781491958698  ~/.hermes/nas/books/oreilly/Test-Driven-Development-with-Python-2nd-Edition_9781491958698.epub
 ```
@@ -23,7 +23,7 @@ OK   9781491958698  ~/.hermes/nas/books/oreilly/Test-Driven-Development-with-Pyt
 This fork is set up for one operator (Lola / Hermes):
 
 - **Active cookie only.** The token is read from `--jwt`, `$ORM_JWT` or
-  `~/.config/oreilly/jwt`. The script checks the JWT `exp` and makes a live
+  `oreilly.conf` in the repo folder (gitignored; template: `oreilly.conf.example`). The script checks the JWT `exp` and makes a live
   auth call before it downloads anything. A missing, expired or rejected
   token stops the run (exit 2).
 - **Verified books only.** Every file is checked against the size the API
@@ -32,11 +32,11 @@ This fork is set up for one operator (Lola / Hermes):
   non-empty spine, every chapter closes `</html>`). The file is moved into
   place only after it passes. A failed book leaves no file and does not
   replace an existing good copy.
-- **Token renewal.** Store `orm-rt` in `~/.config/oreilly/rt` (or `$ORM_RT`)
-  next to the last `orm-jwt`. When `orm-jwt` has under 3 minutes left, the
+- **Token renewal.** Put `ORM_RT` and the last `ORM_JWT` in `oreilly.conf`
+  (or `$ORM_RT` / `$ORM_JWT`). When `orm-jwt` has under 3 minutes left, the
   script waits for it to expire, then sends `orm-rt` + the old `orm-jwt` to
   `https://learning.oreilly.com/profile/`. O'Reilly answers with a new
-  `orm-jwt` (Set-Cookie), which is saved (mode 600). This is the same call a
+  `orm-jwt` (Set-Cookie), which is written back to `oreilly.conf` (mode 600). This is the same call a
   browser makes on a page load. O'Reilly does not renew a token that is still
   live, and `orm-rt` alone is not enough. `--check-auth` renews and verifies
   without downloading.

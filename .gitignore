@@ -1,3 +1,5 @@
 .venv/
 *.epub
 *.epub.part
+oreilly.conf
+oreilly.tmp
