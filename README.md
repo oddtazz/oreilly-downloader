@@ -11,9 +11,6 @@ You need to have a valid JWT to download content. If you do not provide one,
 each chapter will be cut short. You can get it by logging in with your browser
 and extracting the `orm-jwt` cookie using the developer tools.
 
-Before any usage, please read the [O'Reilly Terms of
-Service](https://learning.oreilly.com/terms/).
-
 # Usage
 
 ```
