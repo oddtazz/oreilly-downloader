@@ -8,3 +8,7 @@
 #           one when you replace ORM_RT; an expired one also works.
 ORM_RT=
 ORM_JWT=
+
+# Optional settings
+# OUT_DIR=~/Books/oreilly          # where epubs are saved (default: ./books in this folder)
+# ALERT_TARGET=telegram            # on failure, alert via `hermes send -t ...` (default: none)

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Launcher: sets up the venv on first run, then runs the downloader.
+# Usage: ./oreilly-dl --setup    then    ./oreilly-dl <isbn|url> ...   or   ./oreilly-dl -f list.txt
+set -euo pipefail
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+if [ ! -x "$DIR/.venv/bin/python" ]; then
+  echo "First run: creating .venv and installing aiohttp + lxml..." >&2
+  python3 -m venv "$DIR/.venv" && "$DIR/.venv/bin/pip" -q install aiohttp lxml
+fi
+exec "$DIR/.venv/bin/python" "$DIR/oreilly_downloader.py" "$@"
