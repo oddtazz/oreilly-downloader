@@ -32,6 +32,12 @@ This fork is set up for one operator (Lola / Hermes):
   non-empty spine, every chapter closes `</html>`). The file is moved into
   place only after it passes. A failed book leaves no file and does not
   replace an existing good copy.
+- **Full books only.** For titles the account cannot read, O'Reilly serves a
+  preview: every chapter is cut short but still returns HTTP 200. The script
+  fails the book if any chapter is short, if all chapters together are under
+  93% of the declared size, if the file list does not cover the book's
+  declared total size, or if the item is not a book. Unfinished Early Release
+  (rough cut) books are refused unless `--allow-early-release` is given.
 - **Alert on failure only.** A failure sends a message with
   `hermes send -t $OREILLY_ALERT_TARGET` (default `telegram`). Success is quiet.
 - Output dir: `$OREILLY_DL_DIR` (default `~/.hermes/nas/books/oreilly`).

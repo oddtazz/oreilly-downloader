@@ -15,6 +15,11 @@ Customised for Lola (Hermes) as the only user:
   requests) fail the book.
 * The epub is written to a temp file and moved into place only after it
   passes verification. A failed book leaves no file behind.
+* Full books only. O'Reilly serves a preview (each chapter cut short, still
+  HTTP 200) for titles the account cannot read. A book passes only if every
+  chapter is complete, the HTML total is >= 93% of the declared size, the file
+  list matches the book's declared total size, and it is not an Early Release
+  (rough cut) unless --allow-early-release is given.
 * Alerts go out only when a book fails (Telegram DM via `hermes send`).
   Success is silent apart from stdout.
 
@@ -47,6 +52,8 @@ CONCURRENCY = 4             # parallel file downloads; higher trips rate limits
 RETRIES = 5
 HTML_MIN_RATIO = 0.85       # downloaded/declared size for HTML chapters
 HTML_SMALL = 4096           # below this, HTML size varies too much to compare
+BOOK_MIN_RATIO = 0.93       # downloaded/declared size for all HTML in the book
+TOTAL_SIZE_SLACK = 0.02     # file list vs book total_size tolerance
 
 CONTAINER = b"""<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
@@ -179,9 +186,14 @@ def size_problem(entry, raw):
     return None
 
 
-async def fetch_book(book_id, session):
+async def fetch_book(book_id, session, *, allow_early=False):
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
     meta = await get(session, f'{BASE_URL}/api/v2/epubs/urn:orm:book:{book_id}/', as_json=True)
+    if meta.get('content_format') not in (None, 'book'):
+        raise BookError(f"not a book (content_format={meta.get('content_format')})")
+    if meta.get('roughcut') and not allow_early:
+        raise BookError('Early Release (rough cut): book is unfinished; '
+                        'use --allow-early-release to take it anyway')
 
     entries, expected, url = [], None, BASE_URL + root_path + '?limit=200'
     while url:
@@ -191,13 +203,20 @@ async def fetch_book(book_id, session):
         url = page.get('next')
     if expected is None or len(entries) != expected:
         raise BookError(f'file list incomplete: {len(entries)}/{expected}')
+    declared = sum(e.get('file_size') or 0 for e in entries)
+    total = meta.get('total_size') or 0
+    if total and declared < total * (1 - TOTAL_SIZE_SLACK):
+        raise BookError(f'file list covers {declared}/{total} bytes of the book')
+    if not any(e['full_path'].endswith(('.html', '.xhtml')) for e in entries):
+        raise BookError('no chapters in file list')
 
     sem = asyncio.Semaphore(CONCURRENCY)
-    files, problems = {}, []
+    files, problems, raw_sizes = {}, [], {}
 
     async def one(entry):
         async with sem:
             raw = await get(session, entry['url'])
+        raw_sizes[entry['full_path']] = len(raw)
         reason = size_problem(entry, raw)
         if reason:
             problems.append(f"{entry['full_path']}: {reason}")
@@ -207,7 +226,14 @@ async def fetch_book(book_id, session):
 
     await asyncio.gather(*[one(e) for e in entries])
     if problems:
-        raise BookError(f'{len(problems)} bad file(s): ' + '; '.join(sorted(problems)[:5]))
+        raise BookError(f'partial book, {len(problems)} bad file(s): '
+                        + '; '.join(sorted(problems)[:5]))
+    html = [e for e in entries if e['full_path'].endswith(('.html', '.xhtml'))]
+    want = sum(e.get('file_size') or 0 for e in html)
+    got = sum(raw_sizes[e['full_path']] for e in html)
+    if want and got < want * BOOK_MIN_RATIO:
+        raise BookError(f'partial book: chapters total {got}/{want} bytes '
+                        f'({got / want:.0%}); account likely has preview access only')
     return meta, entries, files
 
 
@@ -285,6 +311,8 @@ async def amain():
     p.add_argument('--no-alert', action='store_true', help='do not send failure alerts')
     p.add_argument('--force', action='store_true', help='re-download books already on disk')
     p.add_argument('--json', action='store_true', help='print one JSON result per book')
+    p.add_argument('--allow-early-release', action='store_true',
+                   help='accept unfinished Early Release (rough cut) books')
     args = p.parse_args()
     alerts = not args.no_alert
 
@@ -314,7 +342,8 @@ async def amain():
             try:
                 if exp - time.time() < MIN_TOKEN_SECS:
                     raise TokenError(f'orm-jwt expired at {fmt_ts(exp)}')
-                meta, entries, files = await fetch_book(book_id, session)
+                meta, entries, files = await fetch_book(
+                    book_id, session, allow_early=args.allow_early_release)
                 path, manifest, spine = write_epub(book_id, meta, entries, files)
                 results.append({
                     'id': book_id, 'ok': True, 'path': str(path), 'title': meta.get('title'),
