@@ -6,3 +6,4 @@ oreilly.tmp
 __pycache__/
 books/
 oreilly.conf.lock
+*.log

@@ -43,6 +43,7 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 
 import aiohttp
 from lxml import etree
@@ -79,34 +80,61 @@ class Pace:
     are skipped, so re-running resumes).
     """
 
-    def __init__(self):
+    def __init__(self, rate=1.0):
         self.throttles = 0
         self.cool_end = 0.0
         self.lock = asyncio.Lock()
+        self.open = None            # asyncio.Event, created lazily inside the loop
+        self.rate = rate            # average requests per second, all requests together
+        self.next_slot = 0.0
+        self.slot_lock = None
+
+    async def before_request(self):
+        """Wait for any cool-off, then for this request's slot in the rate limit."""
+        if self.open is None:
+            self.open, self.slot_lock = asyncio.Event(), asyncio.Lock()
+            self.open.set()
+        await self.open.wait()
+        if self.rate > 0:
+            async with self.slot_lock:
+                now = time.time()
+                gap = random.uniform(0.6, 1.4) / self.rate
+                wait = max(0.0, self.next_slot - now)
+                self.next_slot = max(now, self.next_slot) + gap
+            if wait:
+                await asyncio.sleep(wait)
+        await self.open.wait()
 
     async def hit(self, url, status, sent_at):
         async with self.lock:
             if sent_at < self.cool_end:
                 return      # same throttle event as a parallel request; cool-off already done
-            self.throttles += 1
-            if self.throttles > 1:
-                raise Throttled(f'HTTP {status} again; O\'Reilly is rate-limiting this account')
-            say(f'O\'Reilly answered HTTP {status} (rate limit). Pausing all downloads for '
-                f'{COOL_OFF // 60} min, then retrying once.')
-            await countdown(COOL_OFF, 'cool-off')
-            self.cool_end = time.time()
+            self.open.clear()       # every other request now waits too
+            try:
+                self.throttles += 1
+                if self.throttles > 1:
+                    raise Throttled(f'HTTP {status} again; O\'Reilly is rate-limiting this account')
+                say(f'O\'Reilly answered HTTP {status} (rate limit). Pausing all downloads for '
+                    f'{COOL_OFF // 60} min, then retrying once.')
+                await countdown(COOL_OFF, 'cool-off')
+                self.cool_end = time.time()
+            finally:
+                if self.throttles <= 1:
+                    self.open.set()
 
 
 PACE = Pace()
-HTML_MIN_RATIO = 0.85       # downloaded/declared size for HTML chapters
+HTML_MIN_RATIO = 0.5        # downloaded/declared size for HTML chapters. Full chapters
+                            # come back at 0.70-1.06 (API serves the body only); previews
+                            # are a fixed ~1-3.5 KB snippet, i.e. well under 0.5
 HTML_SMALL = 4096           # below this, HTML size varies too much to compare
-BOOK_MIN_RATIO = 0.93       # downloaded/declared size for all HTML in the book
+BOOK_MIN_RATIO = 0.6        # downloaded/declared size for all HTML in the book
 TOTAL_SIZE_SLACK = 0.02     # file list vs book total_size tolerance
 
 CONTAINER = b"""<?xml version="1.0"?>
 <container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
     <rootfiles>
-        <rootfile full-path="EPUB/content.opf" media-type="application/oebps-package+xml"/>
+        <rootfile full-path="EPUB/{opf}" media-type="application/oebps-package+xml"/>
     </rootfiles>
 </container>
 """  # noqa
@@ -426,6 +454,7 @@ async def get(session, url, *, as_json=False, tokens=None):
     for attempt in range(RETRIES):
         if tokens is not None:
             await tokens.fresh(REQUEST_MARGIN)
+        await PACE.before_request()
         sent_at = time.time()
         async with session.get(url) as r:
             status = r.status
@@ -476,12 +505,33 @@ def to_xhtml(s, root_path):
     )
 
 
+HTML_TYPES = ('text/html', 'application/xhtml+xml')
+HTML_EXTS = ('.html', '.htm', '.xhtml', '.xht')
+
+
+def is_html(entry_or_path):
+    if isinstance(entry_or_path, dict):
+        if entry_or_path.get('media_type') in HTML_TYPES:
+            return True
+        entry_or_path = entry_or_path['full_path']
+    return entry_or_path.lower().endswith(HTML_EXTS)
+
+
+def find_opf(entries):
+    opfs = [e['full_path'] for e in entries
+            if e.get('media_type') == 'application/oebps-package+xml'
+            or e['full_path'].lower().endswith('.opf')]
+    if not opfs:
+        raise BookError('no .opf package file in the file list')
+    return 'content.opf' if 'content.opf' in opfs else opfs[0]
+
+
 def size_problem(entry, raw):
     """Return a reason string if the downloaded bytes look incomplete."""
     want, got = entry.get('file_size') or 0, len(raw)
     if got == 0:
         return 'empty'
-    if entry['full_path'].endswith(('.html', '.xhtml')):
+    if is_html(entry):
         if want >= HTML_SMALL and got < want * HTML_MIN_RATIO:
             return f'truncated ({got}/{want} bytes)'
     elif want and got != want:
@@ -511,7 +561,7 @@ async def fetch_book(book_id, session, *, allow_early=False, tokens=None, label=
     total = meta.get('total_size') or 0
     if total and declared < total * (1 - TOTAL_SIZE_SLACK):
         raise BookError(f'file list covers {declared}/{total} bytes of the book')
-    if not any(e['full_path'].endswith(('.html', '.xhtml')) for e in entries):
+    if not any(is_html(e) for e in entries):
         raise BookError('no chapters in file list')
 
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -528,7 +578,7 @@ async def fetch_book(book_id, session, *, allow_early=False, tokens=None, label=
             problems.append(f"{entry['full_path']}: {reason}")
             return
         path = entry['full_path']
-        files[path] = to_xhtml(raw, root_path) if path.endswith(('.html', '.xhtml')) else raw
+        files[path] = to_xhtml(raw, root_path) if is_html(entry) else raw
 
     try:
         await asyncio.gather(*[one(e) for e in entries])
@@ -537,7 +587,7 @@ async def fetch_book(book_id, session, *, allow_early=False, tokens=None, label=
     if problems:
         raise BookError(f'partial book, {len(problems)} bad file(s): '
                         + '; '.join(sorted(problems)[:5]))
-    html = [e for e in entries if e['full_path'].endswith(('.html', '.xhtml'))]
+    html = [e for e in entries if is_html(e)]
     want = sum(e.get('file_size') or 0 for e in html)
     got = sum(raw_sizes[e['full_path']] for e in html)
     if want and got < want * BOOK_MIN_RATIO:
@@ -556,19 +606,25 @@ def verify_epub(path, entries):
         missing = [e['full_path'] for e in entries if f"EPUB/{e['full_path']}" not in names]
         if missing:
             raise BookError(f'{len(missing)} file(s) missing from epub: {missing[:5]}')
-        if 'EPUB/content.opf' not in names:
-            raise BookError('content.opf missing')
-        opf = etree.fromstring(z.read('EPUB/content.opf'))
+        opf_path = f'EPUB/{find_opf(entries)}'
+        if opf_path not in names:
+            raise BookError(f'{opf_path} missing')
+        container = z.read('META-INF/container.xml').decode()
+        if f'full-path="{opf_path}"' not in container:
+            raise BookError('container.xml does not point at the .opf')
+        opf = etree.fromstring(z.read(opf_path))
+        base = opf_path.rsplit('/', 1)[0]
         ns = {'o': 'http://www.idpf.org/2007/opf'}
         hrefs = [i.get('href') for i in opf.findall('.//o:manifest/o:item', ns)]
-        absent = [h for h in hrefs if f'EPUB/{h}' not in names]
+        # hrefs are URIs: 'image_%281%29.png' is the file 'image_(1).png'
+        absent = [h for h in hrefs if f'{base}/{unquote(h.split("#")[0])}' not in names]
         if absent:
             raise BookError(f'{len(absent)} manifest item(s) missing: {absent[:5]}')
         spine = opf.findall('.//o:spine/o:itemref', ns)
         if not spine:
             raise BookError('empty spine')
         for n in names:
-            if n.endswith(('.html', '.xhtml')) and b'</html>' not in z.read(n):
+            if is_html(n) and b'</html>' not in z.read(n):
                 raise BookError(f'{n} has no closing </html>')
         return len(hrefs), len(spine)
 
@@ -585,7 +641,8 @@ def write_epub(book_id, meta, entries, files, out_dir=OUT_DIR):
     try:
         with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zfh:
             zfh.writestr('mimetype', b'application/epub+zip', compress_type=zipfile.ZIP_STORED)
-            zfh.writestr('META-INF/container.xml', CONTAINER)
+            zfh.writestr('META-INF/container.xml', CONTAINER.replace(
+                b'{opf}', find_opf(entries).encode()))
             for path, data in files.items():
                 zfh.writestr(f'EPUB/{path}', data)
         manifest, spine = verify_epub(tmp, entries)
@@ -708,12 +765,15 @@ async def amain():
                    help=f'download at most N books this run (default {MAX_BOOKS}); the rest wait for the next run')
     p.add_argument('--pause', type=int, nargs=2, default=list(BOOK_PAUSE), metavar=('MIN', 'MAX'),
                    help=f'random pause between books in seconds (default {BOOK_PAUSE[0]} {BOOK_PAUSE[1]})')
+    p.add_argument('--rate', type=float, default=1.0, metavar='R',
+                   help='average requests per second across the run (default 1.0; 0 = no limit)')
     p.add_argument('-q', '--quiet', action='store_true', help='only print the final summary and errors')
     p.add_argument('--jwt', help=argparse.SUPPRESS)
     args = p.parse_args()
 
-    global OUT, QUIET
+    global OUT, QUIET, PACE
     QUIET = args.quiet
+    PACE = Pace(args.rate)
     if args.json:
         OUT = sys.stderr
 
