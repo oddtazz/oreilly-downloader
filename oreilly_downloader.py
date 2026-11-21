@@ -4,7 +4,7 @@
 #   "lxml",
 # ]
 # ///
-"""Download O'Reilly books as verified epub files.
+"""Download O'Reilly books, audiobooks, and video courses.
 
 Quick start:  oreilly-dl --setup   then   oreilly-dl <isbn|url> ...   or   oreilly-dl -f list.txt
 Run `oreilly-dl -h` for all options.
@@ -13,20 +13,14 @@ Run `oreilly-dl -h` for all options.
   and an orm-rt is stored, it waits for expiry (O'Reilly will not renew a
   live token), renews orm-jwt itself and saves it. It then makes a live auth call before any download. No usable
   token means exit 2.
-* Each file is checked against the size the API reports. HTML chapters that
-  come back short (the silent truncation O'Reilly does for unauthenticated
-  requests) fail the book.
-* The epub is written to a temp file and moved into place only after it
-  passes verification. A failed book leaves no file behind.
-* Full books only. O'Reilly serves a preview (each chapter cut short, still
-  HTTP 200) for titles the account cannot read. A book passes only if every
-  chapter is complete, the HTML total is >= 93% of the declared size, the file
-  list matches the book's declared total size, and it is not an Early Release
-  (rough cut) unless --allow-early-release is given.
-* Alerts go out only when a book fails (Telegram DM via `hermes send`).
+* Ebooks are saved as verified .epub files. Each file is checked against the size the API reports.
+* Media (audiobooks and video courses) are downloaded via Kaltura HLS streams
+  losslessly using ffmpeg, saved as numbered chapters in a title folder with metadata and subtitles.
+* Full items only. Previews and partial downloads are detected and refused.
+* Alerts go out only when an item fails (Telegram DM via `hermes send`).
   Success is silent apart from stdout.
 
-Exit codes: 0 all books OK, 1 one or more books failed, 2 token problem.
+Exit codes: 0 all OK, 1 one or more failed, 2 token problem, 3 rate-limited.
 """
 
 import argparse
@@ -37,6 +31,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -412,10 +407,13 @@ async def countdown(secs, what):
 
 
 class Progress:
-    """Per-book progress: live bar on a terminal, 25% steps otherwise."""
+    """Per-item progress: live bar on a terminal, 25% steps otherwise."""
 
-    def __init__(self, files, total_bytes, label):
-        self.files, self.total, self.label = files, max(total_bytes, 1), label
+    def __init__(self, files, total_bytes, label, unit='files'):
+        self.files = files
+        self.total = total_bytes
+        self.label = label
+        self.unit = unit
         self.n = self.got = 0
         self.t0 = time.time()
         self.tty = OUT.isatty() and not QUIET
@@ -424,13 +422,18 @@ class Progress:
     def step(self, nbytes):
         self.n += 1
         self.got += nbytes
-        pct = min(100, self.got * 100 // self.total)
+        if self.total and self.total > 0:
+            pct = min(100, self.got * 100 // self.total)
+        elif self.files > 0:
+            pct = min(100, self.n * 100 // self.files)
+        else:
+            pct = 0
         if self.tty:
             bar = '#' * (pct // 5) + '-' * (20 - pct // 5)
-            print(f'\r{self.label}  [{bar}] {pct:3d}%  {self.n}/{self.files} files  '
+            print(f'\r{self.label}  [{bar}] {pct:3d}%  {self.n}/{self.files} {self.unit}  '
                   f'{self.got / 1e6:.1f} MB', end='', file=OUT, flush=True)
         elif not QUIET and pct >= self.next_pct:
-            say(f'{self.label}  {pct}%  ({self.n}/{self.files} files)')
+            say(f'{self.label}  {pct}%  ({self.n}/{self.files} {self.unit})')
             self.next_pct = (pct // 25 + 1) * 25
 
     def done(self):
@@ -539,10 +542,11 @@ def size_problem(entry, raw):
     return None
 
 
-async def fetch_book(book_id, session, *, allow_early=False, tokens=None, label=''):
+async def fetch_book(book_id, session, *, allow_early=False, tokens=None, label='', meta=None):
     root_path = f'/api/v2/epubs/urn:orm:book:{book_id}/files/'
-    meta = await get(session, f'{BASE_URL}/api/v2/epubs/urn:orm:book:{book_id}/',
-                     as_json=True, tokens=tokens)
+    if meta is None:
+        meta = await get(session, f'{BASE_URL}/api/v2/epubs/urn:orm:book:{book_id}/',
+                         as_json=True, tokens=tokens)
     if meta.get('content_format') not in (None, 'book'):
         raise BookError(f"not a book (content_format={meta.get('content_format')})")
     if meta.get('roughcut') and not allow_early:
@@ -594,6 +598,212 @@ async def fetch_book(book_id, session, *, allow_early=False, tokens=None, label=
         raise BookError(f'partial book: chapters total {got}/{want} bytes '
                         f'({got / want:.0%}); account likely has preview access only')
     return meta, entries, files
+
+
+# --- media (video & audiobook) --------------------------------------------
+
+def sanitize_filename(name):
+    """Clean string for use as a filesystem filename across platforms."""
+    name = re.sub(r'[\\/*?:"<>|]', '_', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name[:120] or 'clip'
+
+
+def to_srt(transcriptions):
+    """Convert O'Reilly transcription lines to standard SRT subtitle string."""
+    if not transcriptions:
+        return ''
+    lines = []
+    if isinstance(transcriptions, list):
+        for t in transcriptions:
+            if isinstance(t, dict) and 'transcription' in t:
+                lines.extend(t['transcription'].get('lines', []))
+            elif isinstance(t, dict) and 'lines' in t:
+                lines.extend(t['lines'])
+    elif isinstance(transcriptions, dict):
+        lines = transcriptions.get('lines', [])
+    if not lines:
+        return ''
+
+    def fmt_time(t_str):
+        t_str = t_str.strip().replace(',', '.')
+        parts = t_str.split(':')
+        if len(parts) == 2:
+            h = 0
+            m, s = int(parts[0]), float(parts[1])
+        elif len(parts) == 3:
+            h, m = int(parts[0]), int(parts[1])
+            s = float(parts[2])
+        else:
+            return t_str
+        ms = int(round((s - int(s)) * 1000))
+        return f'{h:02d}:{m:02d}:{int(s):02d},{ms:03d}'
+
+    srt_out = []
+    for idx, item in enumerate(lines, 1):
+        begin = fmt_time(item.get('begin', '00:00:00.000'))
+        end = fmt_time(item.get('end', '00:00:00.000'))
+        text = (item.get('text') or '').strip()
+        if text:
+            srt_out.append(f'{idx}\n{begin} --> {end}\n{text}\n')
+    return '\n'.join(srt_out)
+
+
+async def fetch_media(item_id, playlist_meta, session, *, out_dir, tokens=None, label='', force=False):
+    """Download video course or audiobook chapters via Kaltura HLS using ffmpeg."""
+    if not shutil.which('ffmpeg'):
+        raise BookError('ffmpeg is required to download video and audiobook media. Please install ffmpeg.')
+
+    title = playlist_meta.get('title') or 'media'
+    content_format = playlist_meta.get('content_format') or playlist_meta.get('work_format') or 'video'
+    ext = '.m4a' if content_format == 'audiobook' else '.mp4'
+
+    clip_urls = playlist_meta.get('video_clips', [])
+    if not clip_urls:
+        toc_url = playlist_meta.get('toc_url') or f'{BASE_URL}/api/v1/videotocs/{item_id}/'
+        try:
+            toc_data = await get(session, toc_url, as_json=True, tokens=tokens)
+            clip_urls = [
+                f"{BASE_URL}/api/v1/videoclips/{e['reference_id']}/"
+                for e in toc_data.get('toc', [])
+                if e.get('reference_id') and e.get('ourn')
+            ]
+        except Exception:
+            pass
+
+    if not clip_urls:
+        raise BookError(f'no clips found for media {item_id}')
+
+    # Fetch clip metadata in parallel
+    clip_sem = asyncio.Semaphore(5)
+    clips_data = [None] * len(clip_urls)
+
+    async def get_clip_meta(idx, curl):
+        async with clip_sem:
+            try:
+                data = await get(session, curl, as_json=True, tokens=tokens)
+                clips_data[idx] = data
+            except Exception as e:
+                problems.append(f'metadata for {curl}: {e}')
+
+    problems = []
+    await asyncio.gather(*[get_clip_meta(i, u) for i, u in enumerate(clip_urls)])
+    valid_clips = [c for c in clips_data if c and (c.get('kaltura_entry_id') or c.get('kalturaEntryId'))]
+    if not valid_clips:
+        raise BookError(f'no playable streaming clips found for media {item_id}')
+
+    # Fetch Kaltura session credentials
+    k_config = await get(session, f'{BASE_URL}/api/v1/player/kaltura_config/', as_json=True, tokens=tokens)
+    k_session = await get(session, f'{BASE_URL}/api/v1/player/kaltura_session/', as_json=True, tokens=tokens)
+    partner_id = k_config.get('partner_id', '1926081')
+    ks = k_session.get('session')
+    if not ks:
+        raise BookError('failed to obtain Kaltura session for streaming media')
+
+    # Prepare destination folder
+    dir_name = f"{slug(title)}_{item_id}"
+    media_dir = out_dir / dir_name
+    media_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save cover image if available
+    cover_path = media_dir / 'cover.jpg'
+    if not cover_path.exists() or force:
+        ourn = playlist_meta.get('ourn')
+        if ourn:
+            try:
+                cover_bytes = await get(session, f'{BASE_URL}/covers/{ourn}/400w/', tokens=tokens)
+                if cover_bytes:
+                    cover_path.write_bytes(cover_bytes)
+            except Exception:
+                pass
+
+    # Save metadata.json
+    total_dur = playlist_meta.get('total_running_time_secs') or sum(c.get('duration') or 0 for c in valid_clips)
+    meta_info = {
+        'id': item_id,
+        'title': title,
+        'content_format': content_format,
+        'ourn': playlist_meta.get('ourn'),
+        'total_duration_seconds': total_dur,
+        'clip_count': len(valid_clips),
+        'clips': [
+            {
+                'index': i + 1,
+                'title': c.get('title'),
+                'duration': c.get('duration'),
+                'reference_id': c.get('reference_id'),
+                'kaltura_entry_id': c.get('kaltura_entry_id') or c.get('kalturaEntryId'),
+            }
+            for i, c in enumerate(valid_clips)
+        ]
+    }
+    (media_dir / 'metadata.json').write_text(json.dumps(meta_info, indent=2), encoding='utf-8')
+
+    # Download each clip
+    sem = asyncio.Semaphore(CONCURRENCY)
+    prog = Progress(len(valid_clips), 0, label, unit='clips')
+    pad = max(2, len(str(len(valid_clips))))
+    total_bytes = 0
+
+    async def download_one(idx, clip):
+        nonlocal total_bytes
+        clip_title = clip.get('title') or f'clip_{idx}'
+        safe_title = sanitize_filename(clip_title)
+        target_file = media_dir / f"{idx:0{pad}d} - {safe_title}{ext}"
+        srt_file = media_dir / f"{idx:0{pad}d} - {safe_title}.srt"
+
+        if not force and target_file.exists() and target_file.stat().st_size > 0:
+            sz = target_file.stat().st_size
+            total_bytes += sz
+            prog.step(sz)
+            return
+
+        entry_id = clip.get('kaltura_entry_id') or clip.get('kalturaEntryId')
+        manifest_url = (f"https://cdnapisec.kaltura.com/p/{partner_id}/sp/{partner_id}00/"
+                        f"playManifest/entryId/{entry_id}/format/applehttp/protocol/https/ks/{ks}/a.m3u8")
+        temp_file = target_file.with_name(f"{target_file.stem}.part{ext}")
+
+        async with sem:
+            if tokens is not None:
+                await tokens.fresh(REQUEST_MARGIN)
+            await PACE.before_request()
+            proc = await asyncio.create_subprocess_exec(
+                'ffmpeg', '-y', '-nostats', '-loglevel', 'error',
+                '-headers', f'User-Agent: {UA}\r\n',
+                '-i', manifest_url,
+                '-c', 'copy',
+                str(temp_file),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0 or not temp_file.exists() or temp_file.stat().st_size == 0:
+                err = stderr.decode('utf-8', errors='replace').strip() if stderr else 'unknown error'
+                temp_file.unlink(missing_ok=True)
+                raise BookError(f"ffmpeg download failed for clip {idx} ({clip_title}): {err[:150]}")
+
+            temp_file.replace(target_file)
+            sz = target_file.stat().st_size
+            total_bytes += sz
+            prog.step(sz)
+
+        # Transcriptions / Subtitles
+        transcriptions = clip.get('transcriptions')
+        if transcriptions:
+            try:
+                srt_text = to_srt(transcriptions)
+                if srt_text:
+                    srt_file.write_text(srt_text, encoding='utf-8')
+            except Exception:
+                pass
+
+    try:
+        await asyncio.gather(*[download_one(i + 1, c) for i, c in enumerate(valid_clips)])
+    finally:
+        prog.done()
+
+    (media_dir / '.complete').touch()
+    return media_dir, len(valid_clips), total_bytes
 
 
 # --- verify + write --------------------------------------------------------
@@ -671,14 +881,67 @@ def alert(lines, target):
 # --- input helpers ---------------------------------------------------------
 
 def parse_book_id(text):
-    """Accept an ISBN/O'Reilly id or a learning.oreilly.com book URL."""
+    """Accept an ISBN/O'Reilly id or a learning.oreilly.com URL (book, video, or audiobook)."""
     text = text.strip()
-    m = re.search(r'/library/view/[^/]+/(\w+)', text) or re.search(r'urn:orm:book:(\w+)', text)
+    m = re.search(r'/(?:library/view|videos|audiobooks?|course)/[^/]+/([0-9A-Za-z_-]+)', text)
+    if m:
+        val = m.group(1)
+        return val.upper() if re.fullmatch(r'[0-9a-zA-Z]{9,20}', val) else val
+    m = re.search(r'urn:orm:(?:book|audiobook|video):([0-9A-Za-z_-]+)', text)
     if m:
         return m.group(1)
-    if re.fullmatch(r'[0-9X]{9,13}', text, re.I):
+    if re.fullmatch(r'\d{9,14}[0-9A-Za-z]{0,6}', text) or re.fullmatch(r'[0-9X]{9,13}', text, re.I):
         return text.upper()
     return None
+
+
+def find_downloaded(item_id, out_dir):
+    """Check if item_id is already downloaded as an epub or complete media directory."""
+    epubs = list(out_dir.glob(f'*_{item_id}.epub'))
+    if epubs:
+        return epubs[0]
+    dirs = [d for d in out_dir.glob(f'*_{item_id}') if d.is_dir()]
+    for d in dirs:
+        if (d / '.complete').exists():
+            return d
+        media_files = list(d.glob('*.mp4')) + list(d.glob('*.m4a'))
+        if media_files and (d / 'metadata.json').exists():
+            try:
+                meta = json.loads((d / 'metadata.json').read_text(encoding='utf-8'))
+                expected = meta.get('clip_count', 0)
+                if expected and len(media_files) >= expected:
+                    return d
+            except Exception:
+                pass
+    return None
+
+
+async def detect_item_type(item_id, session, tokens=None):
+    """Detect if item_id is a book (epub) or media (video/audiobook).
+
+    Returns (type_str, meta) where type_str is 'book' or 'media', or (None, None).
+    """
+    try:
+        epub_url = f'{BASE_URL}/api/v2/epubs/urn:orm:book:{item_id}/'
+        meta = await get(session, epub_url, as_json=True, tokens=tokens)
+        if meta and meta.get('content_format') in (None, 'book'):
+            return 'book', meta
+    except BookError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        media_url = f'{BASE_URL}/api/v1/videoplaylists/{item_id}/'
+        meta = await get(session, media_url, as_json=True, tokens=tokens)
+        if meta and (meta.get('video_clips') or meta.get('identifier') or meta.get('title')):
+            return 'media', meta
+    except BookError:
+        pass
+    except Exception:
+        pass
+
+    return None, None
 
 
 def read_id_file(path):
@@ -726,45 +989,46 @@ def setup_config():
 EPILOG = """examples:
   oreilly-dl 9781491903063                 download one book (ISBN)
   oreilly-dl https://learning.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/
+  oreilly-dl https://learning.oreilly.com/videos/prompt-engineering-in/9781633436305AU/
   oreilly-dl -f books.txt                  ids/URLs from a file, one per line (# comments OK)
   oreilly-dl -f - < books.txt              same, from stdin
   oreilly-dl --setup                       paste your cookies (first-time setup)
   oreilly-dl --check                       is my login still good?
 
 pacing (to stay polite and avoid scraping flags):
-  at most 2 files at a time, a random 45-120 s pause between books, and
-  10 books per run (--max-books). On a rate-limit answer it pauses 5 min and
-  retries once; a second one ends the run. Re-run later to resume: books
+  at most 2 files/clips at a time, a random 45-120 s pause between items, and
+  10 items per run (--max-books). On a rate-limit answer it pauses 5 min and
+  retries once; a second one ends the run. Re-run later to resume: items
   already downloaded are skipped.
 
-exit codes: 0 all OK, 1 a book failed, 2 login problem, 3 rate-limited (run again later)
+exit codes: 0 all OK, 1 an item failed, 2 login problem, 3 rate-limited (run again later)
 """
 
 
 async def amain():
     p = argparse.ArgumentParser(
         prog='oreilly-dl',
-        description="Download complete O'Reilly books as epub. Partial/preview books are refused.",
+        description="Download complete O'Reilly books, audiobooks, and video courses.",
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('books', nargs='*', metavar='BOOK',
-                   help='ISBN, O\'Reilly id, or learning.oreilly.com book URL')
+    p.add_argument('books', nargs='*', metavar='ITEM',
+                   help="ISBN, O'Reilly id, or learning.oreilly.com URL (book, video, or audiobook)")
     p.add_argument('-f', '--file', action='append', default=[], metavar='FILE',
-                   help='read book ids/URLs from FILE, one per line ("-" = stdin). Repeatable.')
-    p.add_argument('-o', '--out', metavar='DIR', help=f'save epubs here (default: {OUT_DIR})')
+                   help='read ids/URLs from FILE, one per line ("-" = stdin). Repeatable.')
+    p.add_argument('-o', '--out', metavar='DIR', help=f'save downloads here (default: {OUT_DIR})')
     p.add_argument('--setup', action='store_true', help='paste orm-rt and orm-jwt into the config')
     p.add_argument('--check', '--check-auth', dest='check', action='store_true',
                    help='check (and renew) the login, download nothing')
-    p.add_argument('--force', action='store_true', help='download again even if the epub exists')
+    p.add_argument('--force', action='store_true', help='download again even if already downloaded')
     p.add_argument('--allow-early-release', action='store_true',
                    help='accept unfinished Early Release (rough cut) books')
-    p.add_argument('--json', action='store_true', help='print one JSON result per book')
+    p.add_argument('--json', action='store_true', help='print one JSON result per item')
     p.add_argument('--alert', metavar='TARGET',
                    help='on failure, send a message via `hermes send -t TARGET` (e.g. telegram)')
     p.add_argument('--no-alert', action='store_true', help='never send a failure alert')
     p.add_argument('--max-books', type=int, default=MAX_BOOKS, metavar='N',
-                   help=f'download at most N books this run (default {MAX_BOOKS}); the rest wait for the next run')
+                   help=f'download at most N items this run (default {MAX_BOOKS}); the rest wait for the next run')
     p.add_argument('--pause', type=int, nargs=2, default=list(BOOK_PAUSE), metavar=('MIN', 'MAX'),
-                   help=f'random pause between books in seconds (default {BOOK_PAUSE[0]} {BOOK_PAUSE[1]})')
+                   help=f'random pause between items in seconds (default {BOOK_PAUSE[0]} {BOOK_PAUSE[1]})')
     p.add_argument('--rate', type=float, default=1.0, metavar='R',
                    help='average requests per second across the run (default 1.0; 0 = no limit)')
     p.add_argument('-q', '--quiet', action='store_true', help='only print the final summary and errors')
@@ -795,7 +1059,7 @@ async def amain():
         book_ids += ids
         bad += [f'{f} {x}' for x in b]
     if bad:
-        p.error('not a book id or URL: ' + ', '.join(bad[:5]))
+        p.error('not a valid id or URL: ' + ', '.join(bad[:5]))
     book_ids = list(dict.fromkeys(book_ids))   # dedupe, keep order
     if not book_ids and not args.check:
         p.print_help()
@@ -812,7 +1076,7 @@ async def amain():
         tokens = Tokens(load_jwt(args.jwt), load_rt())
         await tokens.fresh()
     except (TokenError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-        alert([f'login: {e}', f"books: {' '.join(book_ids)}"], target)
+        alert([f'login: {e}', f"items: {' '.join(book_ids)}"], target)
         return 2
 
     timeout = aiohttp.ClientTimeout(total=None, sock_read=60)
@@ -821,60 +1085,76 @@ async def amain():
         try:
             user = await check_auth(session)
         except TokenError as e:
-            alert([f'login: {e}', f"books: {' '.join(book_ids)}"], target)
+            alert([f'login: {e}', f"items: {' '.join(book_ids)}"], target)
             return 2
         say(f'Logged in as {user}. Token valid until {fmt_ts(tokens.exp)}; renews itself.')
         if args.check:
             return 0
 
-        todo = [b for b in book_ids if args.force or not list(out_dir.glob(f'*_{b}.epub'))]
+        todo = [b for b in book_ids if args.force or find_downloaded(b, out_dir) is None]
         have = len(book_ids) - len(todo)
         later = todo[args.max_books:] if args.max_books > 0 else []
         todo = todo[:args.max_books] if args.max_books > 0 else todo
-        say(f'{len(book_ids)} book(s) in list: {have} already downloaded, {len(todo)} to get now'
+        say(f'{len(book_ids)} item(s) in list: {have} already downloaded, {len(todo)} to get now'
             + (f', {len(later)} left for the next run (--max-books {args.max_books})' if later else '')
             + f'.\nSaving to {out_dir}')
         if len(todo) > 1:
             est = (len(todo) - 1) * (pmin + pmax) / 2
-            say(f'Pausing {pmin}-{pmax}s between books; expect roughly {_fmt_secs(est)} of pauses.')
+            say(f'Pausing {pmin}-{pmax}s between items; expect roughly {_fmt_secs(est)} of pauses.')
 
         tokens.session = session
         results, n, stop = [], len(todo), None
         for b in book_ids:
             if b not in todo and b not in later:
+                dl_path = find_downloaded(b, out_dir)
                 results.append({'id': b, 'ok': True, 'skipped': True,
-                                'path': str(next(out_dir.glob(f'*_{b}.epub')))})
+                                'path': str(dl_path or '')})
         for i, book_id in enumerate(todo, 1):
             if stop:
                 results.append({'id': book_id, 'ok': False, 'not_tried': True, 'error': f'not tried: {stop}'})
                 continue
             tag = f'[{i}/{n}] {book_id}'
             if i > 1:
-                await countdown(random.uniform(pmin, pmax), 'pause between books')
-            say(f'{tag}  fetching book info...')
+                await countdown(random.uniform(pmin, pmax), 'pause between items')
+            say(f'{tag}  fetching info...')
             t0 = time.time()
             try:
                 for attempt in (1, 2):
                     await tokens.fresh()
                     before, thr = tokens.changes, PACE.throttles
                     try:
-                        meta, entries, files = await fetch_book(
-                            book_id, session, allow_early=args.allow_early_release,
-                            tokens=tokens, label=tag)
+                        item_type, meta = await detect_item_type(book_id, session, tokens=tokens)
+                        if not item_type:
+                            raise BookError(f'item {book_id} not found (neither book nor video/audiobook)')
+
+                        if item_type == 'book':
+                            if meta.get('roughcut') and not args.allow_early_release:
+                                raise BookError('Early Release (rough cut): book is unfinished; '
+                                                'use --allow-early-release to take it anyway')
+                            meta, entries, files = await fetch_book(
+                                book_id, session, allow_early=args.allow_early_release,
+                                tokens=tokens, label=tag, meta=meta)
+                            path, manifest, spine = write_epub(book_id, meta, entries, files, out_dir)
+                            r = {'id': book_id, 'ok': True, 'path': str(path), 'title': meta.get('title'),
+                                 'type': 'book', 'files': len(entries), 'manifest': manifest, 'spine': spine,
+                                 'mb': round(path.stat().st_size / 1e6, 1), 'secs': round(time.time() - t0, 1)}
+                            say(f"{tag}  OK  {r['title']}  ({r['mb']} MB, {r['secs']}s)")
+                        else:  # media (audiobook or video)
+                            media_dir, clip_count, total_bytes = await fetch_media(
+                                book_id, meta, session, out_dir=out_dir, tokens=tokens,
+                                label=tag, force=args.force)
+                            fmt = meta.get('content_format', 'media')
+                            r = {'id': book_id, 'ok': True, 'path': str(media_dir), 'title': meta.get('title'),
+                                 'type': fmt, 'clips': clip_count,
+                                 'mb': round(total_bytes / 1e6, 1), 'secs': round(time.time() - t0, 1)}
+                            say(f"{tag}  OK  {r['title']}  ({clip_count} clips, {r['mb']} MB, {r['secs']}s)")
                         break
                     except BookError as e:
-                        # A token swap or a cool-off during the book can leave files
-                        # cut short. Retry the whole book once.
                         if attempt == 1 and 'partial' in str(e) and (
                                 tokens.changes != before or PACE.throttles != thr):
-                            say(f'{tag}  interrupted mid-book; downloading it again')
+                            say(f'{tag}  interrupted mid-download; downloading it again')
                             continue
                         raise
-                path, manifest, spine = write_epub(book_id, meta, entries, files, out_dir)
-                r = {'id': book_id, 'ok': True, 'path': str(path), 'title': meta.get('title'),
-                     'files': len(entries), 'manifest': manifest, 'spine': spine,
-                     'mb': round(path.stat().st_size / 1e6, 1), 'secs': round(time.time() - t0, 1)}
-                say(f"{tag}  OK  {r['title']}  ({r['mb']} MB, {r['secs']}s)")
             except Throttled as e:
                 stop = 'rate-limited; run again later to resume'
                 r = {'id': book_id, 'ok': False, 'error': f'Throttled: {e}'}
@@ -908,7 +1188,7 @@ async def amain():
         for r in failed:
             print(f"  FAIL  {r['id']}  {r['error']}")
         if not_tried or deferred:
-            print('  Run the same command again later to continue; finished books are skipped.')
+            print('  Run the same command again later to continue; finished items are skipped.')
     if failed:
         alert([f"{r['id']}: {r['error']}" for r in failed], target)
     if stop and stop.startswith('rate'):

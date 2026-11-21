@@ -1,7 +1,9 @@
-# O'Reilly epub downloader
+# O'Reilly media downloader
 
-Downloads complete O'Reilly books as epub files for reading in another app.
-Partial (preview) books are refused, so every file it saves is the full book.
+Downloads complete O'Reilly books, audiobooks, and video courses.
+- **Ebooks** are saved as verified `.epub` files for reading in your favorite app.
+- **Audiobooks** and **video courses** are downloaded losslessly via Kaltura HLS using `ffmpeg` as numbered chapters (`.m4a` / `.mp4`) in a titled folder, along with cover art, metadata, and subtitles (`.srt`).
+Partial (preview) items are refused, so every file it saves is the full content.
 
 ## First-time setup
 
@@ -21,23 +23,25 @@ Copy `orm-rt` and `orm-jwt`.
 
 The first run creates `.venv` and installs `aiohttp` and `lxml`.
 
-## Download books
+## Download books & media
 
 ```
 ./oreilly-dl 9781491903063                     # by ISBN / O'Reilly id
 ./oreilly-dl https://learning.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/
+./oreilly-dl https://learning.oreilly.com/videos/prompt-engineering-in/9781633436305AU/  # audiobook / video
 ./oreilly-dl -f reading-list.txt               # ids or URLs from a file
 ./oreilly-dl --check                           # is my login still good?
 ./oreilly-dl -h                                # all options
 ```
 
-A book file lists one id or URL per line. Blank lines and `# comments` are
+A list file lists one id or URL per line. Blank lines and `# comments` are
 ignored:
 
 ```
 # reading-list.txt
-9781491903063        # Designing Data-Intensive Applications
-https://learning.oreilly.com/library/view/fluent-python-2nd/9781492056348/
+9781491903063        # Designing Data-Intensive Applications (book)
+https://learning.oreilly.com/videos/prompt-engineering-in/9781633436305AU/ # Audiobook
+https://learning.oreilly.com/videos/kubernetes-for-the/9781838555962/      # Video course
 ```
 
 Output looks like this (the bar and countdowns update in place in a
